@@ -1,96 +1,77 @@
-import tensorflow as tf
-from tensorflow import keras
-from keras.models import Sequential
-from keras.layers import Dense, LSTM, Dropout, Input
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import logging
+from scipy.optimize import curve_fit
 
-tf.get_logger().setLevel(logging.ERROR)
-keras.utils.set_random_seed(17)
+def model_func(k, a, omega, phi, b, c):
+    return a * np.sin(omega * k + phi) + b * k + c
 
-EPOCHS = 100
-BATCH_SIZE = 16
-DROPOUT_VAL = 0.3
-WINDOW_SIZE = 10
+train = pd.read_csv('train.csv')
+test = pd.read_csv('test.csv')
 
-train_data = pd.read_csv('train.csv')
-test_data = pd.read_csv('test.csv')
+k_train = train['k'].values
+x_train = train['x'].values
 
-x_train = train_data['x'].values
-X, y = [], []
-for i in range(len(x_train) - WINDOW_SIZE):
-    X.append(x_train[i:i + WINDOW_SIZE])
-    y.append(x_train[i + WINDOW_SIZE])
-X, y = np.array(X), np.array(y)
+b_trend, c_trend = np.polyfit(k_train, x_train, 1)
+trend = b_trend * k_train + c_trend
+residuals = x_train - trend
 
-train_size = int(0.8 * len(X))
-X_train, y_train = X[:train_size], y[:train_size]
-X_val, y_val = X[train_size:], y[train_size:]
+n = len(k_train)
+freqs = np.fft.fftfreq(n, d=1)
+fft_vals = np.fft.fft(residuals)
+fft_magnitude = np.abs(fft_vals)
 
-inputs = Input(shape=(WINDOW_SIZE, 1))
-x = LSTM(64, return_sequences=True)(inputs)
-x = Dropout(DROPOUT_VAL)(x)
-x = LSTM(32)(x)
-x = Dense(16, activation="relu", kernel_initializer="glorot_uniform")(x)
-output = Dense(1, activation="linear", kernel_initializer="glorot_uniform")(x)
+dominant_freq_idx = np.argmax(fft_magnitude[1:n//2]) + 1
+dominant_freq = abs(freqs[dominant_freq_idx])
+omega_guess = 2 * np.pi * dominant_freq
+print(f"Частота из FFT: {omega_guess:.6f}")
 
-model = keras.Model(inputs, output)
+best_params = None
+best_mse = float('inf')
 
-model.compile(
-    loss='mse',
-    optimizer='adam',
-    metrics=['mae']
+amp_guess = (np.max(residuals) - np.min(residuals)) / 2
+
+bounds = (
+    [0, omega_guess*0.9, -2*np.pi, -np.inf, -np.inf],
+    [amp_guess*5, omega_guess*1.1,  2*np.pi,  np.inf,  np.inf]
 )
 
-model.summary()
+for a0 in [amp_guess, amp_guess*1.5, amp_guess*0.5]:
+    for phi0 in np.linspace(0, 2*np.pi, 8):
+        p0 = [a0, omega_guess, phi0, b_trend, c_trend]
+        try:
+            params, _ = curve_fit(
+                model_func,
+                k_train,
+                x_train,
+                p0=p0,
+                bounds=bounds,
+                maxfev=20000
+            )
+            mse = np.mean((model_func(k_train, *params) - x_train)**2)
+            if mse < best_mse:
+                best_mse = mse
+                best_params = params
+        except RuntimeError:
+            continue
 
-history = model.fit(
-    X_train.reshape(-1, WINDOW_SIZE, 1),
-    y_train,
-    validation_data=(X_val.reshape(-1, WINDOW_SIZE, 1), y_val),
-    epochs=EPOCHS,
-    batch_size=BATCH_SIZE,
-    verbose=2,
-    shuffle=True
-)
+a, omega, phi, b, c = best_params
+print(f"\nЛучшие параметры:\n"
+      f"a = {a:.6f}, ω = {omega:.6f}, φ = {phi:.6f}, b = {b:.6f}, c = {c:.6f}")
+print(f"Лучший MSE: {best_mse:.6f}")
 
-print("\nИстория обучения (первые 4 эпохи):")
-for epoch in range(min(4, EPOCHS)):
-    print(f"Epoch {epoch+1}/{EPOCHS} - Train MAE: {history.history['mae'][epoch]:.4f} - Train Loss: {history.history['loss'][epoch]:.4f} - Val MAE: {history.history['val_mae'][epoch]:.4f} - Val Loss: {history.history['val_loss'][epoch]:.4f}")
+k_test = test['k'].values
+x_pred = model_func(k_test, *best_params)
 
-plt.plot(history.history['loss'], label='loss')
-plt.plot(history.history['val_loss'], label='val_loss')
-plt.title('Loss')
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
-plt.legend(['train', 'validation'])
-plt.savefig('loss_plot.png')
+pd.DataFrame({'k': k_test, 'x': x_pred}).to_csv('pred.csv', index=False)
+print("pred.csv сохранён")
+
+plt.figure(figsize=(10,5))
+plt.scatter(k_train, x_train, s=10, label='Train data', color='blue')
+plt.plot(k_train, model_func(k_train, *best_params), color='red', label='Model fit')
+plt.xlabel('k')
+plt.ylabel('x')
+plt.legend()
+plt.grid(True)
+plt.savefig('fit_plot.png')
 plt.close()
-
-plt.plot(history.history['mae'], label='mae')
-plt.plot(history.history['val_mae'], label='val_mae')
-plt.title('Mean Absolute Error')
-plt.xlabel('Epochs')
-plt.ylabel('MAE')
-plt.legend(['train', 'validation'])
-plt.savefig('mae_plot.png')
-plt.close()
-
-last_sequence = x_train[-WINDOW_SIZE:]
-predictions = []
-
-current_sequence = last_sequence.copy()
-for _ in range(len(test_data)):
-    input_seq = current_sequence.reshape(1, WINDOW_SIZE, 1)
-    pred = model.predict(input_seq, verbose=0)[0][0]
-    predictions.append(pred)
-    current_sequence = np.append(current_sequence[1:], pred)
-
-pred_df = pd.DataFrame({'x': predictions})
-pred_df.to_csv('output.csv', index=False)
-print("\nПредсказания сохранены в pred.csv")
-
-val_metrics = model.evaluate(X_val.reshape(-1, WINDOW_SIZE, 1), y_val, verbose=2)
-print(f"\nВалидация: MAE = {val_metrics[1]:.4f}, Loss = {val_metrics[0]:.4f}")
